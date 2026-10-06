@@ -21,7 +21,7 @@
   h1{font-size:1.3rem; margin:8px 0 4px;}
   .hint{color:var(--muted); font-size:0.85rem; line-height:1.4; margin-bottom:16px;}
   label{display:block; font-size:0.85rem; color:var(--muted); margin:14px 0 6px;}
-  input[type=text], input[type=password], textarea{
+  input[type=text], input[type=password], input[type=number], textarea{
     width:100%; padding:10px 12px; border-radius:10px; border:1px solid var(--border);
     background:var(--panel); color:var(--text); font-size:0.95rem; font-family:inherit;
   }
@@ -53,6 +53,7 @@
     <p class="hint">
       Transcribes calls that mix English and Egyptian Arabic, using your own Gemini API key.
       The key and everything else stays in this browser — nothing goes anywhere except Google's API.
+      Long recordings are automatically split into pieces and transcribed one at a time.
     </p>
 
     <label for="apiKey">Gemini API key</label>
@@ -62,6 +63,8 @@
       <summary>Advanced settings</summary>
       <label for="model">Model name</label>
       <input type="text" id="model" value="gemini-3.8-flash">
+      <label for="chunkMinutes">Split recordings longer than this into pieces (minutes)</label>
+      <input type="number" id="chunkMinutes" value="7" min="2" max="30" step="1">
       <label for="prompt">Instructions sent to the model</label>
       <textarea id="prompt" rows="5"></textarea>
     </details>
@@ -79,8 +82,9 @@
     </div>
 
     <p class="foot">
-      Supported audio: mp3, wav, m4a/aac, ogg, flac, webm. Very long recordings may take a couple of
-      minutes to process. If a step fails, it automatically retries with a simpler method for files under ~14 MB.
+      Supported audio: mp3, wav, m4a/aac, ogg, flac, webm. Keep this tab open and the screen on
+      while it works — iOS pauses background tabs, so locking the screen or switching apps can
+      interrupt a long transcription (whatever finished before that stays in the box, though).
     </p>
   </div>
 
@@ -93,7 +97,7 @@ Add an approximate timestamp like [00:30] at the start of each new speaker turn 
 If a word or phrase is unclear, write [inaudible] rather than guessing.`;
 
 const $ = (id) => document.getElementById(id);
-const apiKeyEl = $('apiKey'), modelEl = $('model'), promptEl = $('prompt'),
+const apiKeyEl = $('apiKey'), modelEl = $('model'), chunkMinutesEl = $('chunkMinutes'), promptEl = $('prompt'),
       fileEl = $('audioFile'), goBtn = $('goBtn'), statusEl = $('status'),
       resultEl = $('result'), copyBtn = $('copyBtn'), downloadBtn = $('downloadBtn');
 
@@ -102,6 +106,7 @@ function loadSaved(){
   try{
     apiKeyEl.value = localStorage.getItem('ct_api_key') || '';
     modelEl.value = localStorage.getItem('ct_model') || 'gemini-3.8-flash';
+    chunkMinutesEl.value = localStorage.getItem('ct_chunk_minutes') || '7';
     promptEl.value = localStorage.getItem('ct_prompt') || DEFAULT_PROMPT;
   }catch(e){
     promptEl.value = DEFAULT_PROMPT;
@@ -112,6 +117,7 @@ function saveSetting(key, val){
 }
 apiKeyEl.addEventListener('change', () => saveSetting('ct_api_key', apiKeyEl.value.trim()));
 modelEl.addEventListener('change', () => saveSetting('ct_model', modelEl.value.trim()));
+chunkMinutesEl.addEventListener('change', () => saveSetting('ct_chunk_minutes', chunkMinutesEl.value));
 promptEl.addEventListener('change', () => saveSetting('ct_prompt', promptEl.value));
 loadSaved();
 
@@ -125,6 +131,25 @@ function setBusy(isBusy){
 }
 
 const MAX_INLINE_BYTES = 14 * 1024 * 1024; // safe margin under the 20MB request limit after base64 overhead
+
+// --- screen wake lock: best-effort, keeps the screen from auto-sleeping while we work ---
+let wakeLock = null;
+async function requestWakeLock(){
+  try{
+    if ('wakeLock' in navigator){
+      wakeLock = await navigator.wakeLock.request('screen');
+      wakeLock.addEventListener('release', () => { wakeLock = null; });
+    }
+  }catch(e){ console.warn('wake lock unavailable', e); }
+}
+function releaseWakeLock(){
+  try{ if (wakeLock){ wakeLock.release(); wakeLock = null; } }catch(e){ /* ignore */ }
+}
+document.addEventListener('visibilitychange', async () => {
+  if (document.visibilityState === 'visible' && goBtn.disabled && !wakeLock){
+    await requestWakeLock();
+  }
+});
 
 function guessMime(file){
   if (file.type) return file.type;
@@ -147,6 +172,128 @@ function fileToBase64(file){
 }
 
 function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+
+// --- cheap duration check (no full decode) ---
+function getAudioDuration(file){
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const audio = document.createElement('audio');
+    audio.preload = 'metadata';
+    audio.onloadedmetadata = () => {
+      const d = audio.duration;
+      URL.revokeObjectURL(url);
+      resolve(d);
+    };
+    audio.onerror = () => { URL.revokeObjectURL(url); reject(new Error('metadata-failed')); };
+    audio.src = url;
+  });
+}
+
+// --- full decode, only used for files long enough to need splitting ---
+async function decodeFile(file){
+  const buf = await file.arrayBuffer();
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  const ctx = new Ctx();
+  try{
+    return await ctx.decodeAudioData(buf);
+  }finally{
+    ctx.close();
+  }
+}
+
+function splitIntoChunks(totalSeconds, chunkSeconds){
+  const ranges = [];
+  let start = 0;
+  while (start < totalSeconds - 0.25){
+    const end = Math.min(totalSeconds, start + chunkSeconds);
+    ranges.push({ start, end });
+    start = end;
+  }
+  return ranges;
+}
+
+// resample+mixdown one time range of an AudioBuffer down to a small mono WAV Blob
+async function sliceToWavBlob(audioBuffer, startSec, endSec, targetRate){
+  const srcRate = audioBuffer.sampleRate;
+  const startSample = Math.floor(startSec * srcRate);
+  const endSample = Math.min(audioBuffer.length, Math.ceil(endSec * srcRate));
+  const frameCount = Math.max(0, endSample - startSample);
+  if (frameCount === 0) return encodeWav(new Float32Array(0), targetRate);
+
+  const channels = audioBuffer.numberOfChannels;
+  const sub = new Float32Array(frameCount);
+  for (let ch = 0; ch < channels; ch++){
+    const data = audioBuffer.getChannelData(ch);
+    for (let i = 0; i < frameCount; i++){
+      sub[i] += data[startSample + i] / channels;
+    }
+  }
+
+  const OfflineCtx = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+  const outLength = Math.max(1, Math.ceil(frameCount * targetRate / srcRate));
+  const offline = new OfflineCtx(1, outLength, targetRate);
+  const tmpBuffer = offline.createBuffer(1, frameCount, srcRate);
+  if (tmpBuffer.copyToChannel) tmpBuffer.copyToChannel(sub, 0);
+  else tmpBuffer.getChannelData(0).set(sub);
+
+  const src = offline.createBufferSource();
+  src.buffer = tmpBuffer;
+  src.connect(offline.destination);
+  src.start(0);
+  const rendered = await offline.startRendering();
+  return encodeWav(rendered.getChannelData(0), targetRate);
+}
+
+function encodeWav(samples, sampleRate){
+  const numFrames = samples.length;
+  const bytesPerSample = 2;
+  const byteRate = sampleRate * bytesPerSample;
+  const dataSize = numFrames * bytesPerSample;
+  const buffer = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(buffer);
+
+  function writeString(offset, str){
+    for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+  }
+
+  writeString(0, 'RIFF');
+  view.setUint32(4, 36 + dataSize, true);
+  writeString(8, 'WAVE');
+  writeString(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, byteRate, true);
+  view.setUint16(32, bytesPerSample, true);
+  view.setUint16(34, 16, true);
+  writeString(36, 'data');
+  view.setUint32(40, dataSize, true);
+
+  let offset = 44;
+  for (let i = 0; i < numFrames; i++, offset += 2){
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+
+  return new Blob([buffer], { type: 'audio/wav' });
+}
+
+function mmss(s){
+  s = Math.max(0, Math.round(s));
+  return String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0');
+}
+
+function buildChunkPrompt(basePrompt, index, total, range){
+  return basePrompt +
+    `\n\nThis is part ${index + 1} of ${total} of a longer call (covers roughly ${mmss(range.start)}-${mmss(range.end)} of the original recording). ` +
+    `Transcribe only this segment. Do not add a summary or preamble, just the transcript for this segment. ` +
+    `Speaker numbering does not need to match other parts.`;
+}
+
+function formatChunkHeader(index, total, range){
+  return `\n----- Part ${index + 1}/${total} (${mmss(range.start)}-${mmss(range.end)}) -----\n`;
+}
 
 // --- Files API upload (handles long recordings; falls back to inline if this fails) ---
 async function uploadFile(file, apiKey){
@@ -244,10 +391,27 @@ async function extractText(res){
   return parts.map(p => p.text || '').join('\n').trim();
 }
 
+// upload+transcribe one file (chunk or whole recording), with inline fallback for small files
+async function transcribeOneFile(file, apiKey, model, prompt){
+  try{
+    const { uri, name, mimeType } = await uploadFile(file, apiKey);
+    await waitForActive(name, apiKey);
+    return await generateFromFileUri(uri, mimeType, apiKey, model, prompt);
+  }catch(err){
+    console.error(err);
+    if (file.size <= MAX_INLINE_BYTES){
+      const mimeType = guessMime(file);
+      return await generateInline(file, mimeType, apiKey, model, prompt);
+    }
+    throw err;
+  }
+}
+
 async function handleTranscribe(){
   const apiKey = apiKeyEl.value.trim();
   const model = (modelEl.value || 'gemini-3.8-flash').trim();
   const prompt = promptEl.value.trim() || DEFAULT_PROMPT;
+  const chunkSeconds = Math.max(120, (parseFloat(chunkMinutesEl.value) || 7) * 60);
   const file = fileEl.files[0];
 
   if (!apiKey){ setStatus('Paste your Gemini API key first.', 'err'); return; }
@@ -255,34 +419,49 @@ async function handleTranscribe(){
 
   setBusy(true);
   resultEl.value = '';
+  await requestWakeLock();
 
   try{
-    setStatus('Uploading audio...');
-    const { uri, name, mimeType } = await uploadFile(file, apiKey);
-    setStatus('Google is processing the audio...');
-    await waitForActive(name, apiKey);
-    setStatus('Transcribing (long calls can take a minute or two)...');
-    const text = await generateFromFileUri(uri, mimeType, apiKey, model, prompt);
+    let duration = null;
+    try{ duration = await getAudioDuration(file); }catch(e){ duration = null; }
+
+    if (duration && isFinite(duration) && duration > chunkSeconds * 1.1){
+      try{
+        setStatus('Reading and splitting audio locally...');
+        const audioBuffer = await decodeFile(file);
+        const ranges = splitIntoChunks(audioBuffer.duration, chunkSeconds);
+
+        for (let i = 0; i < ranges.length; i++){
+          setStatus(`Chunk ${i + 1} of ${ranges.length}: preparing audio...`);
+          const wavBlob = await sliceToWavBlob(audioBuffer, ranges[i].start, ranges[i].end, 16000);
+          const chunkFile = new File([wavBlob], `chunk-${i + 1}.wav`, { type: 'audio/wav' });
+
+          setStatus(`Chunk ${i + 1} of ${ranges.length}: transcribing...`);
+          const chunkPrompt = buildChunkPrompt(prompt, i, ranges.length, ranges[i]);
+          const text = await transcribeOneFile(chunkFile, apiKey, model, chunkPrompt);
+
+          resultEl.value += formatChunkHeader(i, ranges.length, ranges[i]) + text + '\n';
+          setStatus(`Chunk ${i + 1} of ${ranges.length} done.`, 'ok');
+        }
+
+        setStatus('All chunks done.', 'ok');
+        return;
+      }catch(splitErr){
+        console.error('splitting failed, falling back to single pass', splitErr);
+        setStatus('Could not split this file in the browser - processing it as one piece instead (this can take a while)...');
+      }
+    }
+
+    setStatus('Uploading and transcribing...');
+    const text = await transcribeOneFile(file, apiKey, model, prompt);
     resultEl.value = text;
     setStatus('Done.', 'ok');
   }catch(err){
     console.error(err);
-    if (file.size <= MAX_INLINE_BYTES){
-      try{
-        setStatus('Retrying with a simpler method...');
-        const mimeType = guessMime(file);
-        const text = await generateInline(file, mimeType, apiKey, model, prompt);
-        resultEl.value = text;
-        setStatus('Done.', 'ok');
-      }catch(err2){
-        console.error(err2);
-        setStatus('Error: ' + err2.message, 'err');
-      }
-    }else{
-      setStatus('Error: ' + err.message + ' — this file may be too large for the fallback method. Try trimming or compressing it.', 'err');
-    }
+    setStatus('Error: ' + err.message, 'err');
   }finally{
     setBusy(false);
+    releaseWakeLock();
   }
 }
 
