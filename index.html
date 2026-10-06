@@ -131,6 +131,7 @@ function setBusy(isBusy){
 }
 
 const MAX_INLINE_BYTES = 14 * 1024 * 1024; // safe margin under the 20MB request limit after base64 overhead
+const MAX_DECODE_SECONDS = 20 * 60; // don't attempt in-browser decoding beyond this - risks crashing the tab on iPhone
 
 // --- screen wake lock: best-effort, keeps the screen from auto-sleeping while we work ---
 let wakeLock = null;
@@ -295,6 +296,20 @@ function formatChunkHeader(index, total, range){
   return `\n----- Part ${index + 1}/${total} (${mmss(range.start)}-${mmss(range.end)}) -----\n`;
 }
 
+// each chunk's model output has its own [MM:SS] tags starting back at 0;
+// shift them by the chunk's start offset so timestamps read continuously across the whole call
+function shiftTimestamps(text, offsetSeconds){
+  return text.replace(/\[(\d{1,2}):(\d{2})(?::(\d{2}))?\]/g, (match, a, b, c) => {
+    let secs;
+    if (c !== undefined){
+      secs = parseInt(a, 10) * 3600 + parseInt(b, 10) * 60 + parseInt(c, 10);
+    }else{
+      secs = parseInt(a, 10) * 60 + parseInt(b, 10);
+    }
+    return '[' + mmss(secs + offsetSeconds) + ']';
+  });
+}
+
 // --- Files API upload (handles long recordings; falls back to inline if this fails) ---
 async function uploadFile(file, apiKey){
   const mimeType = guessMime(file);
@@ -425,7 +440,7 @@ async function handleTranscribe(){
     let duration = null;
     try{ duration = await getAudioDuration(file); }catch(e){ duration = null; }
 
-    if (duration && isFinite(duration) && duration > chunkSeconds * 1.1){
+    if (duration && isFinite(duration) && duration > chunkSeconds * 1.1 && duration <= MAX_DECODE_SECONDS){
       try{
         setStatus('Reading and splitting audio locally...');
         const audioBuffer = await decodeFile(file);
@@ -439,8 +454,9 @@ async function handleTranscribe(){
           setStatus(`Chunk ${i + 1} of ${ranges.length}: transcribing...`);
           const chunkPrompt = buildChunkPrompt(prompt, i, ranges.length, ranges[i]);
           const text = await transcribeOneFile(chunkFile, apiKey, model, chunkPrompt);
+          const shiftedText = shiftTimestamps(text, ranges[i].start);
 
-          resultEl.value += formatChunkHeader(i, ranges.length, ranges[i]) + text + '\n';
+          resultEl.value += formatChunkHeader(i, ranges.length, ranges[i]) + shiftedText + '\n';
           setStatus(`Chunk ${i + 1} of ${ranges.length} done.`, 'ok');
         }
 
@@ -452,7 +468,8 @@ async function handleTranscribe(){
       }
     }
 
-    setStatus('Uploading and transcribing...');
+    const longNote = (duration && duration > MAX_DECODE_SECONDS) ? ' (long recording - this can take several minutes, keep this tab open)' : '';
+    setStatus('Uploading and transcribing...' + longNote);
     const text = await transcribeOneFile(file, apiKey, model, prompt);
     resultEl.value = text;
     setStatus('Done.', 'ok');
@@ -495,4 +512,3 @@ downloadBtn.addEventListener('click', () => {
 </script>
 </body>
 </html>
-
