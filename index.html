@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Call Transcriber</title>
+<style>
+  :root{
+    --bg:#0f1115; --panel:#171a21; --text:#e9edf3; --muted:#9aa4b2;
+    --accent:#4f8cff; --border:#2a2f3a; --danger:#ff6b6b; --ok:#3ddc84;
+  }
+  @media (prefers-color-scheme: light){
+    :root{ --bg:#f5f6f8; --panel:#ffffff; --text:#1a1d23; --muted:#5b6472; --border:#e1e4ea; }
+  }
+  *{box-sizing:border-box;}
+  body{
+    margin:0; background:var(--bg); color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    padding:16px; max-width:640px; margin:0 auto;
+  }
+  h1{font-size:1.3rem; margin:8px 0 4px;}
+  .hint{color:var(--muted); font-size:0.85rem; line-height:1.4; margin-bottom:16px;}
+  label{display:block; font-size:0.85rem; color:var(--muted); margin:14px 0 6px;}
+  input[type=text], input[type=password], textarea{
+    width:100%; padding:10px 12px; border-radius:10px; border:1px solid var(--border);
+    background:var(--panel); color:var(--text); font-size:0.95rem; font-family:inherit;
+  }
+  textarea{resize:vertical;}
+  input[type=file]{
+    width:100%; padding:12px; border-radius:10px; border:1px dashed var(--border);
+    background:var(--panel); color:var(--text); font-size:0.9rem;
+  }
+  details{margin-top:10px; border:1px solid var(--border); border-radius:10px; padding:8px 12px; background:var(--panel);}
+  summary{cursor:pointer; color:var(--muted); font-size:0.85rem;}
+  button{
+    appearance:none; border:none; border-radius:10px; padding:12px 18px;
+    font-size:1rem; font-weight:600; cursor:pointer; margin-top:16px;
+  }
+  #goBtn{background:var(--accent); color:#fff; width:100%;}
+  #goBtn:disabled{opacity:0.5;}
+  .actions{display:flex; gap:10px; margin-top:10px;}
+  .actions button{flex:1; background:var(--panel); color:var(--text); border:1px solid var(--border); margin-top:0;}
+  #status{min-height:1.4em; font-size:0.85rem; color:var(--muted); margin-top:12px;}
+  #status.err{color:var(--danger);}
+  #status.ok{color:var(--ok);}
+  #result{width:100%; min-height:220px; margin-top:10px; font-family:ui-monospace,Menlo,Consolas,monospace; font-size:0.85rem; line-height:1.5;}
+  .foot{color:var(--muted); font-size:0.75rem; margin-top:28px; line-height:1.5; text-align:center;}
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Call Transcriber</h1>
+    <p class="hint">
+      Transcribes calls that mix English and Egyptian Arabic, using your own Gemini API key.
+      The key and everything else stays in this browser — nothing goes anywhere except Google's API.
+    </p>
+
+    <label for="apiKey">Gemini API key</label>
+    <input type="password" id="apiKey" placeholder="AIza...">
+
+    <details>
+      <summary>Advanced settings</summary>
+      <label for="model">Model name</label>
+      <input type="text" id="model" value="gemini-3.8-flash">
+      <label for="prompt">Instructions sent to the model</label>
+      <textarea id="prompt" rows="5"></textarea>
+    </details>
+
+    <label for="audioFile">Audio file</label>
+    <input type="file" id="audioFile" accept="audio/*">
+
+    <button id="goBtn">Transcribe</button>
+
+    <div id="status"></div>
+    <textarea id="result" readonly placeholder="Your transcript will appear here."></textarea>
+    <div class="actions">
+      <button id="copyBtn">Copy</button>
+      <button id="downloadBtn">Download .txt</button>
+    </div>
+
+    <p class="foot">
+      Supported audio: mp3, wav, m4a/aac, ogg, flac, webm. Very long recordings may take a couple of
+      minutes to process. If a step fails, it automatically retries with a simpler method for files under ~14 MB.
+    </p>
+  </div>
+
+<script>
+const DEFAULT_PROMPT = `Transcribe this audio recording verbatim.
+The speakers mix English and Egyptian Arabic in the same conversation (code-switching).
+Write each language as it was actually spoken: Arabic words in Arabic script, English words in English — do not translate anything.
+Label speakers as "Speaker 1", "Speaker 2", etc., based on distinct voices, and start a new line each time the speaker changes.
+Add an approximate timestamp like [00:30] at the start of each new speaker turn if you can tell.
+If a word or phrase is unclear, write [inaudible] rather than guessing.`;
+
+const $ = (id) => document.getElementById(id);
+const apiKeyEl = $('apiKey'), modelEl = $('model'), promptEl = $('prompt'),
+      fileEl = $('audioFile'), goBtn = $('goBtn'), statusEl = $('status'),
+      resultEl = $('result'), copyBtn = $('copyBtn'), downloadBtn = $('downloadBtn');
+
+// --- persist simple settings locally (best-effort; app still works if storage is blocked) ---
+function loadSaved(){
+  try{
+    apiKeyEl.value = localStorage.getItem('ct_api_key') || '';
+    modelEl.value = localStorage.getItem('ct_model') || 'gemini-3.8-flash';
+    promptEl.value = localStorage.getItem('ct_prompt') || DEFAULT_PROMPT;
+  }catch(e){
+    promptEl.value = DEFAULT_PROMPT;
+  }
+}
+function saveSetting(key, val){
+  try{ localStorage.setItem(key, val); }catch(e){ /* ignore */ }
+}
+apiKeyEl.addEventListener('change', () => saveSetting('ct_api_key', apiKeyEl.value.trim()));
+modelEl.addEventListener('change', () => saveSetting('ct_model', modelEl.value.trim()));
+promptEl.addEventListener('change', () => saveSetting('ct_prompt', promptEl.value));
+loadSaved();
+
+function setStatus(msg, kind){
+  statusEl.textContent = msg || '';
+  statusEl.className = kind || '';
+}
+function setBusy(isBusy){
+  goBtn.disabled = isBusy;
+  goBtn.textContent = isBusy ? 'Working...' : 'Transcribe';
+}
+
+const MAX_INLINE_BYTES = 14 * 1024 * 1024; // safe margin under the 20MB request limit after base64 overhead
+
+function guessMime(file){
+  if (file.type) return file.type;
+  const ext = (file.name.split('.').pop() || '').toLowerCase();
+  const map = {
+    mp3:'audio/mpeg', wav:'audio/wav', m4a:'audio/mp4', mp4:'audio/mp4',
+    aac:'audio/aac', ogg:'audio/ogg', oga:'audio/ogg', flac:'audio/flac',
+    webm:'audio/webm', amr:'audio/amr', '3gp':'audio/3gpp'
+  };
+  return map[ext] || 'application/octet-stream';
+}
+
+function fileToBase64(file){
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result).split(',')[1]);
+    reader.onerror = () => reject(new Error('Could not read the file.'));
+    reader.readAsDataURL(file);
+  });
+}
+
+function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+
+// --- Files API upload (handles long recordings; falls back to inline if this fails) ---
+async function uploadFile(file, apiKey){
+  const mimeType = guessMime(file);
+  const startRes = await fetch(
+    `https://generativelanguage.googleapis.com/upload/v1beta/files?key=${encodeURIComponent(apiKey)}`,
+    {
+      method: 'POST',
+      headers: {
+        'X-Goog-Upload-Protocol': 'resumable',
+        'X-Goog-Upload-Command': 'start',
+        'X-Goog-Upload-Header-Content-Length': String(file.size),
+        'X-Goog-Upload-Header-Content-Type': mimeType,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ file: { display_name: file.name } })
+    }
+  );
+  if (!startRes.ok) throw new Error('upload-start-failed:' + startRes.status);
+  const uploadUrl = startRes.headers.get('x-goog-upload-url');
+  if (!uploadUrl) throw new Error('no-upload-url');
+
+  const uploadRes = await fetch(uploadUrl, {
+    method: 'POST',
+    headers: {
+      'X-Goog-Upload-Offset': '0',
+      'X-Goog-Upload-Command': 'upload, finalize'
+    },
+    body: file
+  });
+  if (!uploadRes.ok) throw new Error('upload-failed:' + uploadRes.status);
+  const data = await uploadRes.json();
+  if (!data.file || !data.file.uri) throw new Error('upload-no-file-info');
+  return { uri: data.file.uri, name: data.file.name, mimeType };
+}
+
+async function waitForActive(fileName, apiKey){
+  for (let i = 0; i < 60; i++){
+    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/${fileName}?key=${encodeURIComponent(apiKey)}`);
+    if (res.ok){
+      const data = await res.json();
+      if (data.state === 'ACTIVE') return;
+      if (data.state === 'FAILED') throw new Error('file-processing-failed');
+    }
+    await sleep(3000);
+  }
+  throw new Error('file-processing-timeout');
+}
+
+async function generateFromFileUri(fileUri, mimeType, apiKey, model, prompt){
+  const res = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ parts: [
+          { text: prompt },
+          { file_data: { mime_type: mimeType, file_uri: fileUri } }
+        ]}]
+      })
+    }
+  );
+  return extractText(res);
+}
+
+async function generateInline(file, mimeType, apiKey, model, prompt){
+  const base64 = await fileToBase64(file);
+  const res = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ parts: [
+          { text: prompt },
+          { inline_data: { mime_type: mimeType, data: base64 } }
+        ]}]
+      })
+    }
+  );
+  return extractText(res);
+}
+
+async function extractText(res){
+  const raw = await res.text();
+  let data;
+  try{ data = JSON.parse(raw); }catch(e){ throw new Error('Unexpected response: ' + raw.slice(0, 300)); }
+  if (!res.ok){
+    const msg = (data && data.error && data.error.message) || res.status;
+    throw new Error('API error: ' + msg);
+  }
+  const parts = data && data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts;
+  if (!parts) return '(No text returned. Raw response: ' + raw.slice(0, 300) + ')';
+  return parts.map(p => p.text || '').join('\n').trim();
+}
+
+async function handleTranscribe(){
+  const apiKey = apiKeyEl.value.trim();
+  const model = (modelEl.value || 'gemini-3.8-flash').trim();
+  const prompt = promptEl.value.trim() || DEFAULT_PROMPT;
+  const file = fileEl.files[0];
+
+  if (!apiKey){ setStatus('Paste your Gemini API key first.', 'err'); return; }
+  if (!file){ setStatus('Pick an audio file first.', 'err'); return; }
+
+  setBusy(true);
+  resultEl.value = '';
+
+  try{
+    setStatus('Uploading audio...');
+    const { uri, name, mimeType } = await uploadFile(file, apiKey);
+    setStatus('Google is processing the audio...');
+    await waitForActive(name, apiKey);
+    setStatus('Transcribing (long calls can take a minute or two)...');
+    const text = await generateFromFileUri(uri, mimeType, apiKey, model, prompt);
+    resultEl.value = text;
+    setStatus('Done.', 'ok');
+  }catch(err){
+    console.error(err);
+    if (file.size <= MAX_INLINE_BYTES){
+      try{
+        setStatus('Retrying with a simpler method...');
+        const mimeType = guessMime(file);
+        const text = await generateInline(file, mimeType, apiKey, model, prompt);
+        resultEl.value = text;
+        setStatus('Done.', 'ok');
+      }catch(err2){
+        console.error(err2);
+        setStatus('Error: ' + err2.message, 'err');
+      }
+    }else{
+      setStatus('Error: ' + err.message + ' — this file may be too large for the fallback method. Try trimming or compressing it.', 'err');
+    }
+  }finally{
+    setBusy(false);
+  }
+}
+
+goBtn.addEventListener('click', handleTranscribe);
+
+copyBtn.addEventListener('click', async () => {
+  if (!resultEl.value) return;
+  try{
+    await navigator.clipboard.writeText(resultEl.value);
+    setStatus('Copied.', 'ok');
+  }catch(e){
+    resultEl.select();
+    document.execCommand('copy');
+    setStatus('Copied.', 'ok');
+  }
+});
+
+downloadBtn.addEventListener('click', () => {
+  if (!resultEl.value) return;
+  const blob = new Blob([resultEl.value], { type: 'text/plain' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  a.href = url;
+  a.download = `transcript-${stamp}.txt`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+});
+</script>
+</body>
+</html>
